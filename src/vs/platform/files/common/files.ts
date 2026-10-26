@@ -1561,6 +1561,7 @@ export interface IFilesConfigurationNode {
 	associations: { [filepattern: string]: string };
 	exclude: IExpression;
 	watcherExclude: IGlobPatterns;
+	watcherExcludeGitIgnore: boolean;
 	watcherInclude: string[];
 	encoding: string;
 	autoGuessEncoding: boolean;
