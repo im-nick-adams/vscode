@@ -424,6 +424,12 @@ export interface IAgentHostGitService {
 	 * `undefined` when that cannot be determined, in which case callers must assume they matter.
 	 */
 	hasUnignoredPaths?(workingDirectory: URI, resources: readonly URI[]): Promise<boolean | undefined>;
+	/**
+	 * Folders in the repository of `workingDirectory` that an ignore rule matches as a whole and that hold no tracked file,
+	 * as `git status --ignored=matching` lists them. Rules of nested `.gitignore` files, `.git/info/exclude` and
+	 * `core.excludesFile` apply. `undefined` when they cannot be determined.
+	 */
+	getIgnoredFolders?(workingDirectory: URI): Promise<readonly URI[] | undefined>;
 
 	/**
 	 * Reads a single git blob via `git show <ref>:<repoRelativePath>` from

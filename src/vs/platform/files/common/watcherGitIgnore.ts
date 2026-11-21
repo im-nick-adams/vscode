@@ -117,6 +117,46 @@ export function getWatcherExcludesFromGitIgnore(contents: string): string[] {
 }
 
 /**
+ * Maximum number of excludes for folders that git ignores, see
+ * {@link getWatcherExcludesFromIgnoredFolders}.
+ */
+const MAX_IGNORED_FOLDER_WATCHER_EXCLUDES = 1000;
+
+/**
+ * Characters that make watchers treat a path as a glob, an escape or a
+ * Windows drive rather than as a literal path.
+ */
+const NON_LITERAL_PATH_CHARACTERS = /[*?[\]{}()!|\\:]/;
+
+/**
+ * Converts folders that git ignores, relative to a watched folder, into
+ * exclude patterns for a recursive watch request on that folder. Unlike the
+ * globs of {@link getWatcherExcludesFromGitIgnore}, these are literal paths,
+ * which watchers match by comparing path prefixes. That stays cheap for many
+ * folders, so the folders that nested `.gitignore` files, `.git/info/exclude`
+ * or `core.excludesFile` ignore can be excluded as well.
+ *
+ * Only folders that git ignores as a whole and that hold no tracked file may
+ * be passed, such as the folders that `git status --ignored=matching` lists.
+ * Folders that `excludes` already exclude, `.git` folders and names that
+ * watchers would read as globs are skipped. When there are more than 1000,
+ * the folders closest to the watched folder are kept.
+ */
+export function getWatcherExcludesFromIgnoredFolders(folders: readonly string[], excludes: readonly string[]): string[] {
+	const literalExcludes = new Set<string>();
+	for (const folder of folders) {
+		const path = folder.replace(/\/+$/, '');
+		if (!path || NON_LITERAL_PATH_CHARACTERS.test(path) || hasControlCharacter(path) || path.split('/').includes('.git') || excludes.some(exclude => match(exclude, path))) {
+			continue;
+		}
+		literalExcludes.add(path);
+	}
+
+	const depth = (path: string) => path.split('/').length;
+	return [...literalExcludes].sort((a, b) => depth(a) - depth(b)).slice(0, MAX_IGNORED_FOLDER_WATCHER_EXCLUDES);
+}
+
+/**
  * Whether one of the later negations may re-include a path that matches a
  * pattern whose last segment is `name`.
  */

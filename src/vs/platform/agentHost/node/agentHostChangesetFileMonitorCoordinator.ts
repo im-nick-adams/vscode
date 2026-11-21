@@ -7,10 +7,10 @@ import { equals } from '../../../base/common/arrays.js';
 import { SequencerByKey } from '../../../base/common/async.js';
 import { CancellationToken, CancellationTokenSource } from '../../../base/common/cancellation.js';
 import { Disposable, DisposableMap, IDisposable, IReference, ReferenceCollection, toDisposable } from '../../../base/common/lifecycle.js';
-import { joinPath } from '../../../base/common/resources.js';
+import { basename, isEqualOrParent, relativePath } from '../../../base/common/resources.js';
 import { URI } from '../../../base/common/uri.js';
 import { FileChangesEvent, IFileService } from '../../files/common/files.js';
-import { GIT_IGNORE_FILE_NAME, readGitIgnoreWatcherExcludes } from '../../files/common/watcherGitIgnore.js';
+import { getWatcherExcludesFromIgnoredFolders, GIT_IGNORE_FILE_NAME, readGitIgnoreWatcherExcludes } from '../../files/common/watcherGitIgnore.js';
 import { buildUncommittedChangesetUri, changesetSession, parseChangesetUri } from '../common/changesetUri.js';
 import { isAhpChatChannel, parseSubagentSessionUri } from '../common/state/sessionState.js';
 import { DEFAULT_AGENT_HOST_WATCH_EXCLUDES, IAgentHostFileMonitorService } from './agentHostFileMonitorService.js';
@@ -54,9 +54,8 @@ class WatchInterestReferenceCollection extends ReferenceCollection<string> {
 /** A repository root's shared monitor acquisition. */
 interface IRootWatch extends IDisposable {
 	readonly repositoryRoot: URI;
-	readonly gitIgnoreResource: URI;
-	/** Excludes derived from the root `.gitignore` when the watcher was acquired. */
-	readonly gitIgnoreExcludes: readonly string[];
+	/** Excludes derived from the root `.gitignore` and the folders git ignored when the watcher was acquired. */
+	readonly ignoreExcludes: readonly string[];
 }
 
 /**
@@ -78,10 +77,12 @@ interface IRootWatch extends IDisposable {
  * meanwhile (by the agent or e.g. a `git pull` in a terminal) went unobserved.
  *
  * Root watchers exist only to refresh session Git state, so they also exclude
- * the paths ignored by the root's `.gitignore` (build output such as `target/`
- * would otherwise add watches for every file it churns). The `.gitignore` is
- * read before each acquisition, and the watcher is re-acquired when a change
- * to it alters the derived excludes.
+ * the paths ignored by the root's `.gitignore` and the folders that git lists
+ * as ignored, which covers nested `.gitignore` files (build output such as
+ * `target/` would otherwise add watches for every file it churns). Both are
+ * read before each acquisition, so folders created during a turn are excluded
+ * once the turn ends, and the watcher is re-acquired when a change to any
+ * `.gitignore` under the root alters the derived excludes.
  */
 export class ChangesetFileMonitorCoordinator extends Disposable {
 
@@ -446,17 +447,21 @@ export class ChangesetFileMonitorCoordinator extends Disposable {
 	}
 
 	private async _doUpdateRootWatcher(rootStr: string, repositoryRoot: URI, token: CancellationToken): Promise<void> {
-		const gitIgnoreExcludes = await readGitIgnoreWatcherExcludes(this._fileService, repositoryRoot);
+		const [gitIgnoreExcludes, ignoredFolders] = await Promise.all([
+			readGitIgnoreWatcherExcludes(this._fileService, repositoryRoot),
+			this._getIgnoredFolders(repositoryRoot),
+		]);
 		if (token.isCancellationRequested) {
 			return;
 		}
 		this._rootWatchUpdates.deleteAndDispose(rootStr);
+		const ignoreExcludes = [...gitIgnoreExcludes, ...getWatcherExcludesFromIgnoredFolders(ignoredFolders, [...CHANGESET_WATCH_EXCLUDES, ...gitIgnoreExcludes])];
 		const current = this._rootWatches.get(rootStr);
-		if (current && equals(current.gitIgnoreExcludes, gitIgnoreExcludes)) {
+		if (current && equals(current.ignoreExcludes, ignoreExcludes)) {
 			return;
 		}
 		const acquisition = this._fileMonitorService.acquire(repositoryRoot, changedResources => this._onRootChanged(rootStr, repositoryRoot, changedResources), {
-			excludes: [...CHANGESET_WATCH_EXCLUDES, ...gitIgnoreExcludes],
+			excludes: [...CHANGESET_WATCH_EXCLUDES, ...ignoreExcludes],
 			debounceMs: 750,
 		});
 		if (!acquisition) {
@@ -469,8 +474,7 @@ export class ChangesetFileMonitorCoordinator extends Disposable {
 		// is acquired, so the root never goes unwatched.
 		this._rootWatches.set(rootStr, {
 			repositoryRoot,
-			gitIgnoreResource: joinPath(repositoryRoot, GIT_IGNORE_FILE_NAME),
-			gitIgnoreExcludes,
+			ignoreExcludes,
 			dispose: () => acquisition.dispose(),
 		});
 		if (current) {
@@ -490,9 +494,24 @@ export class ChangesetFileMonitorCoordinator extends Disposable {
 		}
 	}
 
+	/** Folders under the root that git ignores as a whole, relative to the root, or none when git cannot list them. */
+	private async _getIgnoredFolders(repositoryRoot: URI): Promise<string[]> {
+		try {
+			const folders = await this._gitService.getIgnoredFolders?.(repositoryRoot) ?? [];
+			return folders.filter(folder => isEqualOrParent(folder, repositoryRoot)).map(folder => relativePath(repositoryRoot, folder)!);
+		} catch (err) {
+			this._logService.debug(`[ChangesetFileMonitorCoordinator] Could not list the ignored folders under ${repositoryRoot.toString()}`, err);
+			return [];
+		}
+	}
+
 	private _onDidFilesChange(event: FileChangesEvent): void {
+		const gitIgnoreFiles = [...event.rawAdded, ...event.rawUpdated, ...event.rawDeleted].filter(resource => basename(resource) === GIT_IGNORE_FILE_NAME);
+		if (gitIgnoreFiles.length === 0) {
+			return;
+		}
 		for (const [rootStr, watch] of this._rootWatches) {
-			if (event.contains(watch.gitIgnoreResource)) {
+			if (gitIgnoreFiles.some(resource => isEqualOrParent(resource, watch.repositoryRoot))) {
 				this._updateRootWatcher(rootStr, watch.repositoryRoot);
 			}
 		}

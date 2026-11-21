@@ -1887,6 +1887,67 @@ suite('ChangesetSessionCoordinator', () => {
 		});
 	});
 
+	test('excludes the folders that git reports as ignored from a root watcher', async () => {
+		const session = AgentSession.uri('mock', 'session-1').toString();
+		const root = URI.file('/repo');
+		const environment = createEnvironment(root, {
+			...createGitService(root),
+			getIgnoredFolders: async () => [URI.file('/repo/target'), URI.file('/repo/crates/a/output'), URI.file('/repo/we[ir]d'), URI.file('/elsewhere/out')],
+		});
+		environment.fileService.writeGitIgnore(root, '/target/\n');
+		createSession(environment.stateManager, session, 'file:///repo/worktree');
+
+		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
+		await environment.monitor.waitForAcquisitions(1);
+
+		assert.deepStrictEqual(environment.monitor.acquiredExcludes.map(acquisition => acquisition.excludes), [
+			[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'target/**/*', 'target', 'crates/a/output'],
+		]);
+	});
+
+	test('re-acquires a root watcher when a nested .gitignore change alters the ignored folders', async () => {
+		const session = AgentSession.uri('mock', 'session-1').toString();
+		const root = URI.file('/repo');
+		let ignoredFolders: URI[] = [];
+		const environment = createEnvironment(root, { ...createGitService(root), getIgnoredFolders: async () => ignoredFolders });
+		createSession(environment.stateManager, session, 'file:///repo/worktree');
+		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
+		await environment.monitor.waitForAcquisitions(1);
+		environment.gitStateService.clearRefreshes();
+
+		ignoredFolders = [URI.file('/repo/sub/output')];
+		environment.fileService.writeGitIgnore(URI.file('/repo/sub'), 'output/\n');
+		await environment.monitor.waitForDisposals(1);
+
+		assert.deepStrictEqual({
+			acquiredExcludes: environment.monitor.acquiredExcludes.map(acquisition => acquisition.excludes),
+			disposals: environment.monitor.disposals,
+			gitStateRefreshes: environment.gitStateService.refreshed,
+		}, {
+			acquiredExcludes: [
+				[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**'],
+				[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'sub/output'],
+			],
+			disposals: [root.toString()],
+			gitStateRefreshes: [session],
+		});
+	});
+
+	test('watches a root without folder excludes when git cannot list its ignored folders', async () => {
+		const session = AgentSession.uri('mock', 'session-1').toString();
+		const root = URI.file('/repo');
+		const environment = createEnvironment(root, { ...createGitService(root), getIgnoredFolders: () => Promise.reject(new Error('git failed')) });
+		environment.fileService.writeGitIgnore(root, '/target/\n');
+		createSession(environment.stateManager, session, 'file:///repo/worktree');
+
+		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
+		await environment.monitor.waitForAcquisitions(1);
+
+		assert.deepStrictEqual(environment.monitor.acquiredExcludes.map(acquisition => acquisition.excludes), [
+			[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'target/**/*'],
+		]);
+	});
+
 	test('re-attaches root watchers when a working directory is added or removed mid-session', async () => {
 		const session = AgentSession.uri('mock', 'session-1').toString();
 		const rootA = URI.file('/projects/repoA');

@@ -901,6 +901,29 @@ export class AgentHostGitService implements IAgentHostGitService {
 		}
 	}
 
+	async getIgnoredFolders(workingDirectory: URI): Promise<readonly URI[] | undefined> {
+		const repositoryRoot = await this.getRepositoryRoot(workingDirectory);
+		if (!repositoryRoot) {
+			return undefined;
+		}
+		// `matching` lists a folder only when a pattern matches the folder itself, and then none of its contents.
+		const output = await this._runGitStatus(repositoryRoot, ['--porcelain=v1', '-z', '--ignored=matching', '--untracked-files=normal']);
+		if (output === undefined) {
+			return undefined;
+		}
+		const folders: URI[] = [];
+		const entries = output.split('\0');
+		for (let i = 0; i < entries.length; i++) {
+			const entry = entries[i];
+			if (/^(?:[RC].|.[RC]) /.test(entry)) {
+				i++; // a rename or copy is followed by its original path
+			} else if (entry.startsWith('!! ') && entry.endsWith('/')) {
+				folders.push(URI.joinPath(repositoryRoot, entry.slice(3, -1)));
+			}
+		}
+		return folders;
+	}
+
 	/**
 	 * Resolves the merge-base commit-ish the Branch Changes baseline is anchored
 	 * on. With a base branch, prefers the corresponding `origin/<base>`

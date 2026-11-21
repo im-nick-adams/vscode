@@ -20,7 +20,7 @@ import { rm } from 'fs/promises';
 import { createServer, type Socket } from 'net';
 import { tmpdir } from 'os';
 import { NullLogService } from '../../../log/common/log.js';
-import { join } from '../../../../base/common/path.js';
+import { join, relative } from '../../../../base/common/path.js';
 import { URI } from '../../../../base/common/uri.js';
 import { isWindows } from '../../../../base/common/platform.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
@@ -2968,5 +2968,54 @@ suite('AgentHostGitService - hasUnignoredPaths (real git)', () => {
 	(hasGit ? test : test.skip)('is undefined outside a repository', async () => {
 		tmpRoot = mkdtempSync(join(tmpdir(), 'agent-host-git-ignored-none-'));
 		assert.strictEqual(await svc!.hasUnignoredPaths(URI.file(tmpRoot), [URI.file(join(tmpRoot, 'a'))]), undefined);
+	});
+});
+
+suite('AgentHostGitService - getIgnoredFolders (real git)', () => {
+	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
+
+	const hasGit = (() => {
+		try { cp.execFileSync('git', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; }
+	})();
+
+	let tmpRoot: string | undefined;
+	let svc: AgentHostGitService | undefined;
+	const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+
+	setup(() => {
+		tmpRoot = undefined;
+		svc = createGitService(disposables);
+	});
+
+	teardown(async () => {
+		await rmDirWithRetry(tmpRoot);
+	});
+
+	(hasGit ? test : test.skip)('lists folders that an ignore rule matches and that hold no tracked file', async () => {
+		const fs = await import('fs/promises');
+		tmpRoot = realpathSync(mkdtempSync(join(tmpdir(), 'agent-host-git-ignored-folders-')));
+		const root = tmpRoot;
+		const run = (...args: string[]) => cp.execFileSync('git', args, { cwd: root, env, stdio: 'pipe' });
+		run('init', '-q', '-b', 'main');
+		for (const folder of ['src', 'build/deep', 'sub/output/x', 'cache', 'keep/logs/k', 'untracked-only', 'tracked-in-ignored', 'empty-ignored']) {
+			await fs.mkdir(join(root, folder), { recursive: true });
+		}
+		await fs.writeFile(join(root, '.gitignore'), '/build/\n*.log\nkeep/logs/\n!keep/logs/k/\ntracked-in-ignored/\nempty-ignored/\n');
+		await fs.writeFile(join(root, 'sub', '.gitignore'), 'output/\n');
+		await fs.writeFile(join(root, 'cache', '.gitignore'), '*\n');
+		for (const file of ['src/a', 'build/deep/b', 'sub/output/x/c', 'cache/e', 'keep/logs/k/f', 'untracked-only/x.log', 'tracked-in-ignored/t']) {
+			await fs.writeFile(join(root, file), '1');
+		}
+		run('add', '-f', '.gitignore', 'sub/.gitignore', 'src/a', 'tracked-in-ignored/t');
+		run('commit', '-q', '-m', 'init');
+
+		const folders = await svc!.getIgnoredFolders(URI.file(join(root, 'src')));
+
+		assert.deepStrictEqual(folders?.map(folder => relative(root, folder.fsPath).replace(/\\/g, '/')).sort(), ['build', 'empty-ignored', 'keep/logs', 'sub/output']);
+	});
+
+	(hasGit ? test : test.skip)('is undefined outside a repository', async () => {
+		tmpRoot = mkdtempSync(join(tmpdir(), 'agent-host-git-ignored-folders-none-'));
+		assert.strictEqual(await svc!.getIgnoredFolders(URI.file(tmpRoot)), undefined);
 	});
 });

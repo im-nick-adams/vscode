@@ -14,7 +14,7 @@ import { NullLogService } from '../../../log/common/log.js';
 import { FileService } from '../../common/fileService.js';
 import { InMemoryFileSystemProvider } from '../../common/inMemoryFilesystemProvider.js';
 import { parseWatcherPatterns } from '../../common/watcher.js';
-import { getWatcherExcludesFromGitIgnore, readGitIgnoreWatcherExcludes } from '../../common/watcherGitIgnore.js';
+import { getWatcherExcludesFromGitIgnore, getWatcherExcludesFromIgnoredFolders, readGitIgnoreWatcherExcludes } from '../../common/watcherGitIgnore.js';
 
 suite('Watcher .gitignore excludes', () => {
 
@@ -135,5 +135,25 @@ suite('Watcher .gitignore excludes', () => {
 		const present = await readGitIgnoreWatcherExcludes(fileService, folder);
 
 		assert.deepStrictEqual({ missing, present }, { missing: [], present: ['target/**/*'] });
+	});
+
+	test('converts ignored folders into literal excludes, closest to the watched folder first', () => {
+		assert.deepStrictEqual({
+			literal: getWatcherExcludesFromIgnoredFolders(['crates/a/output/', 'target/', 'out/', 'out'], []),
+			alreadyExcluded: getWatcherExcludesFromIgnoredFolders(['node_modules/', 'pkg/node_modules/', 'dist/'], ['node_modules{,/**}', '*/node_modules{,/**}']),
+			globLike: getWatcherExcludesFromIgnoredFolders(['we[ir]d/', 'a{b}/', 'x*y/', 'q?/', '!neg/', 'a\\b/', 'c:d/', 'p(q)/'], []),
+			gitFolders: getWatcherExcludesFromIgnoredFolders(['.git/', 'sub/.git/', '', '/'], []),
+		}, {
+			literal: ['target', 'out', 'crates/a/output'],
+			alreadyExcluded: ['dist'],
+			globLike: [],
+			gitFolders: [],
+		});
+	});
+
+	test('limits the excludes for ignored folders, keeping the folders closest to the watched folder', () => {
+		const excludes = getWatcherExcludesFromIgnoredFolders([...Array.from({ length: 1000 }, (_, index) => `a/b/c${index}/`), 'top/'], []);
+
+		assert.deepStrictEqual({ length: excludes.length, first: excludes[0], last: excludes.at(-1) }, { length: 1000, first: 'top', last: 'a/b/c998' });
 	});
 });
