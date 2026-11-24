@@ -430,6 +430,8 @@ export interface IAgentHostGitService {
 	 * `core.excludesFile` apply. `undefined` when they cannot be determined.
 	 */
 	getIgnoredFolders?(workingDirectory: URI): Promise<readonly URI[] | undefined>;
+	/** Metadata files whose changes can invalidate ignored-folder discovery, including a worktree's actual index. */
+	getRepositoryWatchPaths?(workingDirectory: URI): Promise<readonly URI[] | undefined>;
 
 	/**
 	 * Reads a single git blob via `git show <ref>:<repoRelativePath>` from

@@ -13,14 +13,14 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/c
 import { FileChangesEvent, FileChangeType, IFileService } from '../../../files/common/files.js';
 import { getWatcherExcludesFromGitIgnore } from '../../../files/common/watcherGitIgnore.js';
 import { NullLogService } from '../../../log/common/log.js';
-import { AgentHostFileMonitorCallback, AgentHostFileMonitorService } from '../../node/agentHostFileMonitorService.js';
+import { AgentHostFileMonitorCallback, AgentHostFileMonitorService, IAgentHostFileMonitorOptions } from '../../node/agentHostFileMonitorService.js';
 
 suite('AgentHostFileMonitorService', () => {
 
 	const disposables = ensureNoDisposablesAreLeakedInTestSuite();
 
 
-	function acquire(monitor: AgentHostFileMonitorService, folder: URI, callback: AgentHostFileMonitorCallback, options?: { readonly excludes?: readonly string[]; readonly debounceMs?: number }): IDisposable {
+	function acquire(monitor: AgentHostFileMonitorService, folder: URI, callback: AgentHostFileMonitorCallback, options?: IAgentHostFileMonitorOptions): IDisposable {
 		const registration = monitor.acquire(folder, callback, options);
 		assert.ok(registration, 'expected file monitor acquisition to succeed');
 		return registration;
@@ -185,6 +185,24 @@ suite('AgentHostFileMonitorService', () => {
 		assert.deepStrictEqual({ registration, snapshot: fileService.snapshot() }, { registration: undefined, snapshot: { watches: 1, disposed: 0 } });
 	});
 
+	test('isolates root events from independent customization watches and observes changes before debounce', () => {
+		return runWithFakedTimers({ useFakeTimers: true }, async () => {
+			const fileService = new TestFileService();
+			const monitor = disposables.add(new AgentHostFileMonitorService(fileService.service, new NullLogService()));
+			const notifications: string[] = [];
+			disposables.add(acquire(monitor, URI.file('/repo'), () => notifications.push('root'), {
+				isolated: true, excludes: ['.claude/**/*'], debounceMs: 10,
+				onDidChange: () => notifications.push('invalidate'),
+			}));
+			disposables.add(acquire(monitor, URI.file('/repo/.claude'), () => notifications.push('customization'), { debounceMs: 10 }));
+			fileService.fire(URI.file('/repo/.claude/agents/a.md'));
+			fileService.fireIsolated(URI.file('/repo/.gitignore'));
+			assert.deepStrictEqual(notifications, ['invalidate']);
+			await timeout(11);
+			assert.deepStrictEqual(notifications, ['invalidate', 'customization', 'root']);
+		});
+	});
+
 	test('uses one file-change listener across monitor entries', () => {
 		const fileService = new TestFileService();
 		const monitor = disposables.add(new AgentHostFileMonitorService(fileService.service, new NullLogService()));
@@ -219,6 +237,7 @@ suite('AgentHostFileMonitorService', () => {
 
 class TestFileService {
 	private readonly _onDidFilesChange = new Emitter<FileChangesEvent>();
+	private readonly _onDidIsolatedChange = new Emitter<FileChangesEvent>();
 	private readonly _onDidWatchError = new Emitter<Error>();
 	private _watchCount = 0;
 	private _disposeCount = 0;
@@ -238,6 +257,15 @@ class TestFileService {
 		onWillActivateFileSystemProvider: Event.None,
 		onDidFilesChange: this._onDidFilesChangeEvent,
 		onDidWatchError: this._onDidWatchError.event,
+		createWatcher: (_resource: URI, options: Parameters<IFileService['createWatcher']>[1]) => {
+			this._watchCount++;
+			this.watchedExcludes.push(options.excludes ?? []);
+			return {
+				ready: Promise.resolve(),
+				onDidChange: this._onDidIsolatedChange.event,
+				dispose: () => { this._disposeCount++; },
+			};
+		},
 		watch: (_resource: URI, options?: Parameters<IFileService['watch']>[1]): IDisposable => {
 			this._watchCount++;
 			this.watchedExcludes.push(options?.excludes ?? []);
@@ -251,6 +279,10 @@ class TestFileService {
 
 	fire(resource: URI, type: FileChangeType = FileChangeType.UPDATED): void {
 		this._onDidFilesChange.fire(new FileChangesEvent([{ resource, type }], false));
+	}
+
+	fireIsolated(resource: URI): void {
+		this._onDidIsolatedChange.fire(new FileChangesEvent([{ resource, type: FileChangeType.UPDATED }], false));
 	}
 
 	snapshot(): { watches: number; disposed: number } {

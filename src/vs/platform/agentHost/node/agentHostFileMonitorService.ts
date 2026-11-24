@@ -29,6 +29,12 @@ export const DEFAULT_AGENT_HOST_WATCH_EXCLUDES: readonly string[] = Object.freez
 export interface IAgentHostFileMonitorOptions {
 	readonly excludes?: readonly string[];
 	readonly debounceMs?: number;
+	readonly isolated?: boolean;
+	readonly onDidChange?: (event: FileChangesEvent) => void;
+}
+
+export interface IAgentHostFileMonitorAcquisition extends IDisposable {
+	readonly ready?: Promise<void>;
 }
 
 /** The most distinct resources a monitor remembers for one notification; a notification beyond it reports none. */
@@ -43,7 +49,7 @@ export type AgentHostFileMonitorCallback = (changedResources: readonly URI[] | u
 
 export interface IAgentHostFileMonitorService extends IDisposable {
 	readonly _serviceBrand: undefined;
-	acquire(folder: URI, callback: AgentHostFileMonitorCallback, options?: IAgentHostFileMonitorOptions): IDisposable | undefined;
+	acquire(folder: URI, callback: AgentHostFileMonitorCallback, options?: IAgentHostFileMonitorOptions): IAgentHostFileMonitorAcquisition | undefined;
 }
 
 interface IMonitorEntry extends IDisposable {
@@ -55,6 +61,9 @@ interface IMonitorEntry extends IDisposable {
 	/** What changed since the last notification. */
 	readonly changed: Map<string, URI>;
 	changedOverflowed: boolean;
+	readonly ready?: Promise<void>;
+	readonly changeListeners: Set<(event: FileChangesEvent) => void>;
+	readonly isolated: boolean;
 }
 
 function normalizeExcludes(excludes: readonly string[]): readonly string[] {
@@ -87,16 +96,16 @@ export class AgentHostFileMonitorService extends Disposable implements IAgentHos
 		}));
 	}
 
-	acquire(folder: URI, callback: AgentHostFileMonitorCallback, options: IAgentHostFileMonitorOptions = {}): IDisposable | undefined {
+	acquire(folder: URI, callback: AgentHostFileMonitorCallback, options: IAgentHostFileMonitorOptions = {}): IAgentHostFileMonitorAcquisition | undefined {
 		const canonicalFolder = this._canonicalizeFolder(folder);
 		const excludes = normalizeExcludes(options.excludes ?? DEFAULT_AGENT_HOST_WATCH_EXCLUDES);
 		const debounceMs = options.debounceMs ?? AgentHostFileMonitorService._DEFAULT_DEBOUNCE_MS;
-		const key = this._key(canonicalFolder, excludes, debounceMs);
+		const key = `${this._key(canonicalFolder, excludes, debounceMs)}\u0000${!!options.isolated}`;
 
 		let entry = this._entries.get(key);
 		if (!entry) {
 			try {
-				entry = this._createEntry(key, canonicalFolder, excludes, debounceMs);
+				entry = this._createEntry(key, canonicalFolder, excludes, debounceMs, !!options.isolated);
 			} catch (err) {
 				this._logService.warn(`[AgentHostFileMonitorService] Failed to watch ${canonicalFolder.toString()}`, err);
 				return undefined;
@@ -105,26 +114,40 @@ export class AgentHostFileMonitorService extends Disposable implements IAgentHos
 		}
 
 		entry.callbacks.add(callback);
-		return toDisposable(() => {
+		if (options.onDidChange) {
+			entry.changeListeners.add(options.onDidChange);
+		}
+		const registration = toDisposable(() => {
 			const current = this._entries.get(key);
 			if (!current) {
 				return;
 			}
 			current.callbacks.delete(callback);
+			if (options.onDidChange) {
+				current.changeListeners.delete(options.onDidChange);
+			}
 			if (current.callbacks.size === 0) {
 				this._entries.deleteAndDispose(key);
 			}
 		});
+		return { ready: entry.ready, dispose: () => registration.dispose() };
 	}
 
-	private _createEntry(_key: string, folder: URI, excludes: readonly string[], debounceMs: number): IMonitorEntry {
+	private _createEntry(key: string, folder: URI, excludes: readonly string[], debounceMs: number, isolated: boolean): IMonitorEntry {
 		const disposable = new DisposableStore();
 		try {
 			const debounce = disposable.add(new MutableDisposable<IDisposable>());
 			const callbacks = new Set<AgentHostFileMonitorCallback>();
 			const excludeMatcher = parseExcludes(excludes);
-			disposable.add(this._fileService.watch(folder, { recursive: true, excludes: [...excludes] }));
-			return { folder, callbacks, debounce, debounceMs, excludeMatcher, changed: new Map(), changedOverflowed: false, dispose: () => disposable.dispose() };
+			let ready: Promise<void> | undefined;
+			if (isolated) {
+				const watcher = disposable.add(this._fileService.createWatcher(folder, { recursive: true, excludes: [...excludes] }));
+				ready = watcher.ready;
+				disposable.add(watcher.onDidChange(event => this._onDidFilesChangeEntry(key, event)));
+			} else {
+				disposable.add(this._fileService.watch(folder, { recursive: true, excludes: [...excludes] }));
+			}
+			return { folder, callbacks, debounce, debounceMs, excludeMatcher, changed: new Map(), changedOverflowed: false, ready, isolated, changeListeners: new Set(), dispose: () => disposable.dispose() };
 		} catch (err) {
 			disposable.dispose();
 			throw err;
@@ -133,7 +156,9 @@ export class AgentHostFileMonitorService extends Disposable implements IAgentHos
 
 	private _onDidFilesChange(event: FileChangesEvent): void {
 		for (const key of this._entries.keys()) {
-			this._onDidFilesChangeEntry(key, event);
+			if (!this._entries.get(key)?.isolated) {
+				this._onDidFilesChangeEntry(key, event);
+			}
 		}
 	}
 
@@ -143,6 +168,12 @@ export class AgentHostFileMonitorService extends Disposable implements IAgentHos
 			return;
 		}
 		if (!event.affects(entry.folder) || !this._collectRelevantRawChanges(entry, event)) {
+			return;
+		}
+		for (const listener of entry.changeListeners) {
+			listener(event);
+		}
+		if (this._entries.get(key) !== entry) {
 			return;
 		}
 		entry.debounce.value = disposableTimeout(() => {

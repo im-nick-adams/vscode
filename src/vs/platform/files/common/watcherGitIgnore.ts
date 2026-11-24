@@ -131,10 +131,9 @@ const NON_LITERAL_PATH_CHARACTERS = /[*?[\]{}()!|\\:]/;
 /**
  * Converts folders that git ignores, relative to a watched folder, into
  * exclude patterns for a recursive watch request on that folder. Unlike the
- * globs of {@link getWatcherExcludesFromGitIgnore}, these are literal paths,
- * which watchers match by comparing path prefixes. That stays cheap for many
- * folders, so the folders that nested `.gitignore` files, `.git/info/exclude`
- * or `core.excludesFile` ignore can be excluded as well.
+ * globs of {@link getWatcherExcludesFromGitIgnore}, these exclude only the
+ * descendants of confirmed ignored directories. The directory itself remains
+ * observable when it is deleted or replaced with a regular file.
  *
  * Only folders that git ignores as a whole and that hold no tracked file may
  * be passed, such as the folders that `git status --ignored=matching` lists.
@@ -153,7 +152,7 @@ export function getWatcherExcludesFromIgnoredFolders(folders: readonly string[],
 	}
 
 	const depth = (path: string) => path.split('/').length;
-	return [...literalExcludes].sort((a, b) => depth(a) - depth(b)).slice(0, MAX_IGNORED_FOLDER_WATCHER_EXCLUDES);
+	return [...literalExcludes].sort((a, b) => depth(a) - depth(b)).slice(0, MAX_IGNORED_FOLDER_WATCHER_EXCLUDES).map(path => `${path}/**/*`);
 }
 
 /**

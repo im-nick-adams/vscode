@@ -122,6 +122,13 @@ suite('File Watcher (parcel) request deduplication', () => {
 
 		assert.deepStrictEqual(await watcher.deduplicateRequests([first, second]), [first, second]);
 	});
+
+	test('an isolated changeset root cannot absorb an uncorrelated ignored customization folder', async () => {
+		const watcher = store.add(new TestParcelWatcher());
+		const root: IRecursiveWatchRequest = { path: '/workspace', excludes: ['.claude/**/*'], recursive: true, correlationId: 1 };
+		const customization: IRecursiveWatchRequest = { path: '/workspace/.claude', excludes: [], recursive: true };
+		assert.deepStrictEqual(await watcher.deduplicateRequests([root, customization]), [root, customization]);
+	});
 });
 
 // this suite has shown flaky runs in Azure pipelines where

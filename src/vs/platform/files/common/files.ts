@@ -251,9 +251,8 @@ export interface IFileService {
 	 * The watcher runs correlated and thus, file events will be reported on the returned
 	 * `IFileSystemWatcher` and not on the generic `IFileService.onDidFilesChange` event.
 	 *
-	 * Note: only non-recursive file watching supports event correlation for now.
 	 */
-	createWatcher(resource: URI, options: IWatchOptionsWithoutCorrelation & { recursive: false }): IFileSystemWatcher;
+	createWatcher(resource: URI, options: IWatchOptionsWithoutCorrelation): IFileSystemWatcher;
 
 	/**
 	 * Allows to start a watcher that reports file/folder change events on the provided resource.
@@ -581,6 +580,9 @@ export interface IWatchOptionsWithCorrelation extends IWatchOptions {
 }
 
 export interface IFileSystemWatcher extends IDisposable {
+
+	/** Resolves after provider acquisition, not native backend initialization; rejects when acquisition fails. */
+	readonly ready?: Promise<void>;
 
 	/**
 	 * An event which fires on file/folder change only for changes

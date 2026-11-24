@@ -383,6 +383,37 @@ suite('File Service', () => {
 		assert.strictEqual(watcher2Events.length, 2);
 	});
 
+	test('recursive createWatcher reports provider acquisition and routes only its correlated events', async () => {
+		const service = disposables.add(new FileService(new NullLogService()));
+		let correlationId: number | undefined;
+		const emitter = disposables.add(new Emitter<readonly IFileChange[]>());
+		const provider = new class extends NullFileSystemProvider {
+			override readonly onDidChangeFile = emitter.event;
+			override watch(_resource: URI, options: Parameters<NullFileSystemProvider['watch']>[1]): IDisposable {
+				correlationId = options.correlationId;
+				assert.strictEqual(options.recursive, true);
+				return toDisposable(() => { });
+			}
+		};
+		disposables.add(service.registerProvider('test', provider));
+		const resource = URI.parse('test://watch/root');
+		const watcher = disposables.add(service.createWatcher(resource, { recursive: true, excludes: [] }));
+		const received: string[] = [];
+		disposables.add(watcher.onDidChange(() => received.push('owned')));
+		disposables.add(service.onDidFilesChange(() => received.push('global')));
+		await watcher.ready;
+		emitter.fire([{ resource, type: FileChangeType.UPDATED, cId: correlationId }]);
+		emitter.fire([{ resource, type: FileChangeType.UPDATED }]);
+		assert.deepStrictEqual(received, ['owned', 'global']);
+	});
+
+	test('createWatcher readiness rejects provider acquisition failures', async () => {
+		const service = disposables.add(new FileService(new NullLogService()));
+		disposables.add(service.registerProvider('test', new NullFileSystemProvider(() => { throw new Error('acquisition failed'); })));
+		const watcher = disposables.add(service.createWatcher(URI.parse('test://watch/root'), { recursive: true, excludes: [] }));
+		await assert.rejects(watcher.ready!, /acquisition failed/);
+	});
+
 	test('error from readFile bubbles through (https://github.com/microsoft/vscode/issues/118060) - async', async () => {
 		testReadErrorBubbles(true);
 	});

@@ -144,15 +144,22 @@ suite('Watcher .gitignore excludes', () => {
 		assert.deepStrictEqual({ missing, present }, { missing: [], present: ['target/**/*'] });
 	});
 
-	test('converts ignored folders into literal excludes, closest to the watched folder first', () => {
+	test('ignored folder excludes preserve deletion and replacement-file events at the folder boundary', () => {
+		const folder = URI.file('/repo').fsPath;
+		const excludes = parseWatcherPatterns(folder, getWatcherExcludesFromIgnoredFolders(['sub/output/'], []), false);
+		const paths = ['sub/output', 'sub/output/file', 'sub/output/deep/file', 'sub/output.txt'];
+		assert.deepStrictEqual(paths.filter(path => excludes.some(exclude => exclude(join(folder, path)))), ['sub/output/file', 'sub/output/deep/file']);
+	});
+
+	test('converts ignored folders into descendant excludes, closest to the watched folder first', () => {
 		assert.deepStrictEqual({
 			literal: getWatcherExcludesFromIgnoredFolders(['crates/a/output/', 'target/', 'out/', 'out'], []),
 			alreadyExcluded: getWatcherExcludesFromIgnoredFolders(['node_modules/', 'pkg/node_modules/', 'dist/'], ['node_modules{,/**}', '*/node_modules{,/**}']),
 			globLike: getWatcherExcludesFromIgnoredFolders(['we[ir]d/', 'a{b}/', 'x*y/', 'q?/', '!neg/', 'a\\b/', 'c:d/', 'p(q)/'], []),
 			gitFolders: getWatcherExcludesFromIgnoredFolders(['.git/', 'sub/.git/', '', '/'], []),
 		}, {
-			literal: ['target', 'out', 'crates/a/output'],
-			alreadyExcluded: ['dist'],
+			literal: ['target/**/*', 'out/**/*', 'crates/a/output/**/*'],
+			alreadyExcluded: ['dist/**/*'],
 			globLike: [],
 			gitFolders: [],
 		});
@@ -161,6 +168,6 @@ suite('Watcher .gitignore excludes', () => {
 	test('limits the excludes for ignored folders, keeping the folders closest to the watched folder', () => {
 		const excludes = getWatcherExcludesFromIgnoredFolders([...Array.from({ length: 1000 }, (_, index) => `a/b/c${index}/`), 'top/'], []);
 
-		assert.deepStrictEqual({ length: excludes.length, first: excludes[0], last: excludes.at(-1) }, { length: 1000, first: 'top', last: 'a/b/c998' });
+		assert.deepStrictEqual({ length: excludes.length, first: excludes[0], last: excludes.at(-1) }, { length: 1000, first: 'top/**/*', last: 'a/b/c998/**/*' });
 	});
 });

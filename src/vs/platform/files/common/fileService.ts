@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { coalesce } from '../../../base/common/arrays.js';
-import { Promises, ResourceQueue } from '../../../base/common/async.js';
+import { DeferredPromise, Promises, ResourceQueue } from '../../../base/common/async.js';
 import { bufferedStreamToBuffer, bufferToReadable, newWriteableBufferStream, readableToBuffer, streamToBuffer, VSBuffer, VSBufferReadable, VSBufferReadableBufferedStream, VSBufferReadableStream } from '../../../base/common/buffer.js';
 import { CancellationToken, CancellationTokenSource } from '../../../base/common/cancellation.js';
 import { Emitter } from '../../../base/common/event.js';
@@ -1195,7 +1195,7 @@ export class FileService extends Disposable implements IFileService {
 
 	private static WATCHER_CORRELATION_IDS = 0;
 
-	createWatcher(resource: URI, options: IWatchOptionsWithoutCorrelation & { recursive: false }): IFileSystemWatcher {
+	createWatcher(resource: URI, options: IWatchOptionsWithoutCorrelation): IFileSystemWatcher {
 		return this.watch(resource, {
 			...options,
 			// Explicitly set a correlation id so that file events that originate
@@ -1209,6 +1209,8 @@ export class FileService extends Disposable implements IFileService {
 	watch(resource: URI, options?: IWatchOptionsWithoutCorrelation): IDisposable;
 	watch(resource: URI, options: IWatchOptions = { recursive: false, excludes: [] }): IFileSystemWatcher | IDisposable {
 		const disposables = new DisposableStore();
+		const acquisition = new DeferredPromise<void>();
+		void acquisition.p.catch(() => { /* The acquisition error is logged below, including for callers that do not await readiness. */ });
 
 		// Forward watch request to provider and wire in disposables
 		let watchDisposed = false;
@@ -1225,8 +1227,10 @@ export class FileService extends Disposable implements IFileService {
 				} else {
 					disposeWatch = () => dispose(disposable);
 				}
+				await acquisition.complete();
 			} catch (error) {
 				this.logService.error(error);
+				await acquisition.error(error);
 			}
 		})();
 
@@ -1242,6 +1246,7 @@ export class FileService extends Disposable implements IFileService {
 			}));
 
 			const watcher: IFileSystemWatcher = {
+				ready: acquisition.p,
 				onDidChange: fileChangeEmitter.event,
 				dispose: () => disposables.dispose()
 			};

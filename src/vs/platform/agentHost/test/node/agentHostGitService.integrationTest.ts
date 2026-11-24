@@ -18,17 +18,19 @@ import * as cp from 'child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'fs';
 import { rm } from 'fs/promises';
 import { createServer, type Socket } from 'net';
-import { tmpdir } from 'os';
+import { homedir, tmpdir } from 'os';
+import { DeferredPromise } from '../../../../base/common/async.js';
 import { NullLogService } from '../../../log/common/log.js';
 import { join, relative } from '../../../../base/common/path.js';
 import { URI } from '../../../../base/common/uri.js';
-import { isWindows } from '../../../../base/common/platform.js';
+import { isLinux, isWindows } from '../../../../base/common/platform.js';
 import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
 import { mock } from '../../../../base/test/common/mock.js';
 import { INativeEnvironmentService } from '../../../environment/common/environment.js';
 import { FileService } from '../../../files/common/fileService.js';
 import { Schemas } from '../../../../base/common/network.js';
 import { DiskFileSystemProvider } from '../../../files/node/diskFileSystemProvider.js';
+import { getWatcherExcludesFromIgnoredFolders } from '../../../files/common/watcherGitIgnore.js';
 import { DisposableStore, toDisposable } from '../../../../base/common/lifecycle.js';
 import { autorun } from '../../../../base/common/observable.js';
 import { CheckoutBlockedByLocalChangesError, EMPTY_TREE_OBJECT, GitRefType } from '../../common/agentHostGitService.js';
@@ -58,7 +60,7 @@ class TestLogService extends NullLogService {
 function createGitService(disposables: Pick<DisposableStore, 'add'>, logService: NullLogService = new NullLogService(), ctor: typeof AgentHostGitService = AgentHostGitService): AgentHostGitService {
 	const fileService = disposables.add(new FileService(logService));
 	disposables.add(fileService.registerProvider(Schemas.file, disposables.add(new DiskFileSystemProvider(logService))));
-	const env: Partial<INativeEnvironmentService> = { tmpDir: URI.file(tmpdir()) };
+	const env: Partial<INativeEnvironmentService> = { tmpDir: URI.file(tmpdir()), userHome: URI.file(homedir()) };
 	return new ctor(fileService, env as INativeEnvironmentService, logService);
 }
 
@@ -3017,5 +3019,138 @@ suite('AgentHostGitService - getIgnoredFolders (real git)', () => {
 	(hasGit ? test : test.skip)('is undefined outside a repository', async () => {
 		tmpRoot = mkdtempSync(join(tmpdir(), 'agent-host-git-ignored-folders-none-'));
 		assert.strictEqual(await svc!.getIgnoredFolders(URI.file(tmpRoot)), undefined);
+	});
+
+	(hasGit ? test : test.skip)('getRepositoryWatchPaths resolves a worktree index and shared ignore metadata', async () => {
+		tmpRoot = realpathSync(mkdtempSync(join(tmpdir(), 'agent-host-watch-metadata-')));
+		const run = (...args: string[]) => cp.execFileSync('git', args, { cwd: tmpRoot, env, encoding: 'utf8' });
+		run('init', '-q', '-b', 'main');
+		run('commit', '--allow-empty', '-q', '-m', 'init');
+		const worktree = join(tmpRoot, 'worktree');
+		run('worktree', 'add', '-q', '-b', 'topic', worktree);
+		const paths = await svc!.getRepositoryWatchPaths(URI.file(worktree));
+		assert.deepStrictEqual({
+			index: paths?.some(uri => uri.fsPath === join(tmpRoot!, '.git', 'worktrees', 'worktree', 'index')),
+			exclude: paths?.some(uri => uri.fsPath === join(tmpRoot!, '.git', 'info', 'exclude')),
+		}, { index: true, exclude: true });
+	});
+
+	(hasGit ? test : test.skip)('ignored-folder discovery stops pruning a folder after a force-added file enters the index', async () => {
+		tmpRoot = realpathSync(mkdtempSync(join(tmpdir(), 'agent-host-watch-index-')));
+		const fs = await import('fs/promises');
+		const run = (...args: string[]) => cp.execFileSync('git', args, { cwd: tmpRoot, env });
+		run('init', '-q', '-b', 'main');
+		await fs.mkdir(join(tmpRoot, 'output'));
+		await fs.writeFile(join(tmpRoot, '.gitignore'), 'output/\n');
+		await fs.writeFile(join(tmpRoot, 'output', 'tracked'), '1');
+		const before = await svc!.getIgnoredFolders(URI.file(tmpRoot));
+		run('add', '-f', 'output/tracked');
+		const after = await svc!.getIgnoredFolders(URI.file(tmpRoot));
+		assert.deepStrictEqual({ before: before?.map(uri => relative(tmpRoot!, uri.fsPath)), after }, { before: ['output'], after: [] });
+	});
+
+	(hasGit && isLinux ? test : test.skip)('native watcher delivers a Git-visible replacement file at an ignored-directory boundary', async function () {
+		this.timeout(15000);
+		const fs = await import('fs/promises');
+		const parcel = await import('@parcel/watcher');
+		tmpRoot = realpathSync(mkdtempSync(join(tmpdir(), 'agent-host-watch-replacement-')));
+		const root = tmpRoot;
+		cp.execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root, env });
+		await fs.mkdir(join(root, 'sub', 'output', 'deep'), { recursive: true });
+		await fs.writeFile(join(root, 'sub', '.gitignore'), 'output/\n');
+		await fs.writeFile(join(root, 'sub', 'output', 'deep', 'ignored'), '1');
+		cp.execFileSync('git', ['add', 'sub/.gitignore'], { cwd: root, env });
+		cp.execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: root, env });
+		const folders = await svc!.getIgnoredFolders(URI.file(root));
+		const ignore = getWatcherExcludesFromIgnoredFolders(folders!.map(uri => relative(root, uri.fsPath).replace(/\\/g, '/')), []);
+		let expectedPath = join(root, 'sub', 'output');
+		let change = new DeferredPromise<void>();
+		const subscription = await parcel.subscribe(root, (error, events) => {
+			if (error) {
+				void change.error(error);
+			} else if (events.some(event => event.path === expectedPath)) {
+				void change.complete();
+			}
+		}, { ignore, backend: 'inotify' });
+		try {
+			await fs.rm(expectedPath, { recursive: true });
+			await change.p;
+			change = new DeferredPromise<void>();
+			await fs.writeFile(expectedPath, 'not an ignored directory');
+			await change.p;
+			const status = cp.execFileSync('git', ['status', '--porcelain'], { cwd: root, env, encoding: 'utf8' });
+			expectedPath = join(root, 'control');
+			change = new DeferredPromise<void>();
+			await fs.writeFile(expectedPath, 'control');
+			await change.p;
+			assert.ok(status.includes('?? sub/output'));
+		} finally {
+			await subscription.unsubscribe();
+		}
+	});
+
+	(hasGit && isLinux ? test : test.skip)('native watcher preserves tracked matches, index additions, nested reinclusions and independent customization subscriptions', async function () {
+		this.timeout(15000);
+		const fs = await import('fs/promises');
+		const parcel = await import('@parcel/watcher');
+		tmpRoot = realpathSync(mkdtempSync(join(tmpdir(), 'agent-host-watch-visible-')));
+		const root = tmpRoot;
+		const run = (...args: string[]) => cp.execFileSync('git', args, { cwd: root, env, encoding: 'utf8' });
+		run('init', '-q', '-b', 'main');
+		await fs.mkdir(join(root, 'nested'));
+		await fs.mkdir(join(root, 'output'));
+		await fs.mkdir(join(root, '.claude', 'agents'), { recursive: true });
+		await fs.writeFile(join(root, '.gitignore'), '*.log\n.claude/\noutput/\n');
+		await fs.writeFile(join(root, 'nested', '.gitignore'), '!keep.log\n');
+		await fs.writeFile(join(root, 'tracked.log'), '1');
+		await fs.writeFile(join(root, '.claude', 'agents', 'assistant.md'), '1');
+		await fs.writeFile(join(root, 'output', 'tracked.log'), '1');
+		run('add', '-f', '.gitignore', 'nested/.gitignore', 'tracked.log');
+		run('commit', '-q', '-m', 'init');
+		const folders = await svc!.getIgnoredFolders(URI.file(root));
+		const ignore = getWatcherExcludesFromIgnoredFolders(folders!.map(uri => relative(root, uri.fsPath).replace(/\\/g, '/')), []);
+		let expectedPath = join(root, 'tracked.log');
+		let change = new DeferredPromise<void>();
+		const observe = (error: Error | null, events: { path: string }[]) => {
+			if (error) {
+				void change.error(error);
+			} else if (events.some(event => event.path === expectedPath)) {
+				void change.complete();
+			}
+		};
+		const rootSubscription = await parcel.subscribe(root, observe, { ignore, backend: 'inotify' });
+		try {
+			const childSubscription = await parcel.subscribe(join(root, '.claude'), observe, { backend: 'inotify' });
+			try {
+				await fs.writeFile(expectedPath, '2');
+				await change.p;
+				expectedPath = join(root, 'nested', 'keep.log');
+				change = new DeferredPromise<void>();
+				await fs.writeFile(expectedPath, 'visible');
+				await change.p;
+				expectedPath = join(root, '.claude', 'agents', 'assistant.md');
+				change = new DeferredPromise<void>();
+				await fs.writeFile(expectedPath, '2');
+				await change.p;
+				const status = run('status', '--porcelain');
+				assert.deepStrictEqual({ tracked: status.includes(' M tracked.log'), reincluded: status.includes('?? nested/keep.log') }, { tracked: true, reincluded: true });
+				run('add', '-f', 'output/tracked.log');
+				const updatedFolders = await svc!.getIgnoredFolders(URI.file(root));
+				const updatedIgnore = getWatcherExcludesFromIgnoredFolders(updatedFolders!.map(uri => relative(root, uri.fsPath).replace(/\\/g, '/')), []);
+				const replacement = await parcel.subscribe(root, observe, { ignore: updatedIgnore, backend: 'inotify' });
+				try {
+					expectedPath = join(root, 'output', 'tracked.log');
+					change = new DeferredPromise<void>();
+					await fs.writeFile(expectedPath, '2');
+					await change.p;
+				} finally {
+					await replacement.unsubscribe();
+				}
+			} finally {
+				await childSubscription.unsubscribe();
+			}
+		} finally {
+			await rootSubscription.unsubscribe();
+		}
 	});
 });

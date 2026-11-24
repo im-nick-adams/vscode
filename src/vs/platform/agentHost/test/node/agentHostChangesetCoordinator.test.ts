@@ -257,7 +257,7 @@ suite('ChangesetSessionCoordinator', () => {
 	}
 
 	for (const kind of ['branch', 'uncommitted'] as const) {
-		test(`cold ${kind} subscription refreshes once after restore`, async () => {
+		test(`cold ${kind} subscription refreshes after restore and catches up after acquisition`, async () => {
 			const { coordinator, stateManager, changesets, monitor } = createEnvironment();
 			const session = AgentSession.uri('mock', 'cold-static').toString();
 			const owner = kind === 'branch' ? buildBranchChangesetOwner(session, ['file:///repo'])
@@ -281,7 +281,7 @@ suite('ChangesetSessionCoordinator', () => {
 
 			assert.deepStrictEqual({ restores, refreshes: refreshes.slice(before), monitored: monitor.acquisitions }, {
 				restores: 1,
-				refreshes: [owner],
+				refreshes: [owner, owner],
 				monitored: ['file:///repo'],
 			});
 		});
@@ -879,7 +879,7 @@ suite('ChangesetSessionCoordinator', () => {
 
 		assert.deepStrictEqual({ disposals: environment.monitor.disposals, gitStateRefreshes: environment.gitStateService.refreshed }, {
 			disposals: ['file:///repo'],
-			gitStateRefreshes: [session],
+			gitStateRefreshes: [session, session],
 		});
 	});
 
@@ -1084,8 +1084,8 @@ suite('ChangesetSessionCoordinator', () => {
 		assert.deepStrictEqual({ acquisitions: environment.monitor.acquisitions, disposals: environment.monitor.disposals, refreshes: environment.changesets.uncommittedRefreshes, operationRefreshes: environment.updateOperationsCalls.slice(operationBaseline) }, {
 			acquisitions: ['file:///repo', 'file:///repo'],
 			disposals: ['file:///repo'],
-			refreshes: [session],
-			operationRefreshes: [session, session, session],
+			refreshes: [session, session],
+			operationRefreshes: [session, session, session, session],
 		});
 	});
 
@@ -1118,8 +1118,8 @@ suite('ChangesetSessionCoordinator', () => {
 		assert.deepStrictEqual({ acquisitions: environment.monitor.acquisitions, disposals: environment.monitor.disposals, uncommittedRefreshes: environment.changesets.uncommittedRefreshes }, {
 			acquisitions: ['file:///repo', 'file:///repo'],
 			disposals: ['file:///repo'],
-			// The idle session catches up once the root is watched again, then follows the next root change.
-			uncommittedRefreshes: [firstSession, firstSession, secondSession],
+			// Both sessions catch up after acquisition, then follow the next root change.
+			uncommittedRefreshes: [firstSession, secondSession, firstSession, secondSession],
 		});
 	});
 
@@ -1369,7 +1369,7 @@ suite('ChangesetSessionCoordinator', () => {
 
 		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
 		await environment.gitService.waitForRootLookups(2);
-		await tick();
+		await environment.monitor.waitForAcquisitions(1);
 
 		assert.deepStrictEqual(environment.monitor.acquisitions, [sharedRoot.toString()]);
 	});
@@ -1787,7 +1787,7 @@ suite('ChangesetSessionCoordinator', () => {
 		});
 	});
 
-	test('excludes the gitignored paths of each repository root from its watcher', async () => {
+	test('does not derive unsafe excludes from root ignore rules in a multi-root watch', async () => {
 		const session = AgentSession.uri('mock', 'session-1').toString();
 		const rootA = URI.file('/projects/repoA');
 		const rootB = URI.file('/projects/repoB');
@@ -1803,29 +1803,30 @@ suite('ChangesetSessionCoordinator', () => {
 		await environment.monitor.waitForAcquisitions(2);
 
 		assert.deepStrictEqual(environment.monitor.acquiredExcludes, [
-			{ root: rootA.toString(), excludes: [...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'target/**/*', '.local/**/*', '*/.local/**/*', '*/*/.local/**/*', '*/*/*/.local/**/*'] },
-			{ root: rootB.toString(), excludes: [...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'node_modules{,/**}', '*/node_modules{,/**}', '*/*/node_modules{,/**}', '*/*/*/node_modules{,/**}'] },
+			{ root: rootA.toString(), excludes: [...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**'] },
+			{ root: rootB.toString(), excludes: [...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**'] },
 		]);
 	});
 
 	test('re-acquires a root watcher only when a .gitignore change alters its excludes', async () => {
 		const session = AgentSession.uri('mock', 'session-1').toString();
 		const root = URI.file('/repo');
-		const environment = createEnvironment(root);
+		let folders = [URI.file('/repo/target')];
+		const environment = createEnvironment(root, { ...createGitService(root), getIgnoredFolders: async () => folders });
 		environment.fileService.writeGitIgnore(root, '/target/\n');
 		createSession(environment.stateManager, session, 'file:///repo/worktree');
 		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
 		await environment.monitor.waitForAcquisitions(1);
+		await tick();
 		environment.gitStateService.clearRefreshes();
 
 		// A comment leaves the excludes unchanged, so the watcher is kept.
-		const unchangedRead = Event.toPromise(environment.fileService.onDidStartRead);
 		environment.fileService.writeGitIgnore(root, '# Cargo output\n/target/\n');
-		await unchangedRead;
 		await tick();
 
 		// A new pattern replaces the watcher, and the change it would have reported is refreshed.
-		environment.fileService.writeGitIgnore(root, '/target/\nnode_modules\n');
+		folders = [...folders, URI.file('/repo/generated')];
+		environment.fileService.writeGitIgnore(root, '/target/\ngenerated/\n');
 		await environment.monitor.waitForDisposals(1);
 
 		assert.deepStrictEqual({
@@ -1835,44 +1836,49 @@ suite('ChangesetSessionCoordinator', () => {
 		}, {
 			acquiredExcludes: [
 				[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'target/**/*'],
-				[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'target/**/*', 'node_modules{,/**}', '*/node_modules{,/**}', '*/*/node_modules{,/**}', '*/*/*/node_modules{,/**}'],
+				[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'target/**/*', 'generated/**/*'],
 			],
 			disposals: [root.toString()],
 			gitStateRefreshes: [session],
 		});
 	});
 
-	test('does not acquire a root watcher whose session detaches while its .gitignore read is pending', async () => {
+	test('does not install ignored-folder excludes after detaching during discovery', async () => {
 		const session = AgentSession.uri('mock', 'session-1').toString();
-		const environment = createEnvironment();
+		const query = new DeferredPromise<readonly URI[]>();
+		const environment = createEnvironment(URI.file('/repo'), { ...createGitService(URI.file('/repo')), getIgnoredFolders: () => query.p });
 		createSession(environment.stateManager, session, 'file:///repo/worktree');
-		const releaseReads = environment.fileService.holdReads();
-		const read = Event.toPromise(environment.fileService.onDidStartRead);
 
 		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
-		await read;
+		await tick();
 		environment.coordinator.onLastSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
-		releaseReads();
+		await query.complete([URI.file('/repo/output')]);
 		await tick();
 
 		assert.deepStrictEqual({ acquisitions: environment.monitor.acquisitions, disposals: environment.monitor.disposals }, { acquisitions: [], disposals: [] });
 	});
 
-	test('does not acquire a root watcher that a turn suspends while its .gitignore read is pending', async () => {
+	test('does not install ignored-folder excludes after a turn suspends discovery', async () => {
 		const idleSession = AgentSession.uri('mock', 'session-1').toString();
 		const activeSession = AgentSession.uri('mock', 'session-2').toString();
-		const environment = createEnvironment();
+		const query = new DeferredPromise<readonly URI[]>();
+		let first = true;
+		const environment = createEnvironment(URI.file('/repo'), { ...createGitService(URI.file('/repo')), getIgnoredFolders: () => {
+			if (first) {
+				first = false;
+				return query.p;
+			}
+			return Promise.resolve([]);
+		} });
 		createSession(environment.stateManager, idleSession, 'file:///repo/worktree-a');
 		createSession(environment.stateManager, activeSession, 'file:///repo/worktree-b');
-		const releaseReads = environment.fileService.holdReads();
-		const read = Event.toPromise(environment.fileService.onDidStartRead);
 
 		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(idleSession)));
-		await read;
+		await tick();
 		environment.coordinator.onSessionTurnActiveChanged(activeSession, true);
 		await environment.gitService.waitForRootLookups(2);
 		await tick();
-		releaseReads();
+		await query.complete([URI.file('/repo/output')]);
 		await tick();
 		const acquisitionsDuringTurn = [...environment.monitor.acquisitions];
 
@@ -1901,7 +1907,125 @@ suite('ChangesetSessionCoordinator', () => {
 		await environment.monitor.waitForAcquisitions(1);
 
 		assert.deepStrictEqual(environment.monitor.acquiredExcludes.map(acquisition => acquisition.excludes), [
-			[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'target/**/*', 'target', 'crates/a/output'],
+			[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'target/**/*', 'crates/a/output/**/*'],
+		]);
+	});
+
+	test('does not prune tracked matches or nested reinclusions using root ignore patterns', async () => {
+		const session = AgentSession.uri('mock', 'safe-patterns').toString();
+		const root = URI.file('/repo');
+		const environment = createEnvironment(root);
+		environment.fileService.writeGitIgnore(root, '*.log\n');
+		environment.fileService.writeGitIgnore(URI.file('/repo/nested'), '!keep.log\n');
+		createSession(environment.stateManager, session, root.toString());
+		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
+		await environment.monitor.waitForAcquisitions(1);
+		await tick();
+		assert.deepStrictEqual(environment.monitor.acquiredExcludes.map(item => item.excludes), [
+			[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**'],
+		]);
+	});
+
+	test('catches up source edits made before initial ignored-folder discovery completes without an unpruned recursive watch', async () => {
+		const session = AgentSession.uri('mock', 'pending-source').toString();
+		const root = URI.file('/repo');
+		const query = new DeferredPromise<readonly URI[]>();
+		const environment = createEnvironment(root, { ...createGitService(root), getIgnoredFolders: () => query.p });
+		createSession(environment.stateManager, session, root.toString());
+		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
+		await tick();
+		const before = [...environment.monitor.acquisitions];
+		environment.gitStateService.clearRefreshes();
+		environment.monitor.fire(root, [URI.file('/repo/src/a.ts')]);
+		await tick();
+		await query.complete([]);
+		await tick();
+		assert.deepStrictEqual({ before, refreshed: environment.gitStateService.refreshed }, { before: [], refreshed: [session] });
+	});
+
+	test('invalidates pending ignore snapshots and coalesced ancestor deletions', async () => {
+		const session = AgentSession.uri('mock', 'pending-ignore').toString();
+		const root = URI.file('/repo');
+		const first = new DeferredPromise<readonly URI[]>();
+		let queries = 0;
+		const environment = createEnvironment(root, { ...createGitService(root), getIgnoredFolders: () => ++queries === 1 ? first.p : Promise.resolve([]) });
+		createSession(environment.stateManager, session, root.toString());
+		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
+		await tick();
+		environment.fileService.fire(URI.file('/repo/sub'), FileChangeType.DELETED);
+		await tick();
+		await first.complete([URI.file('/repo/sub/output')]);
+		await tick();
+		assert.deepStrictEqual({ queries, excludes: environment.monitor.acquiredExcludes.map(item => item.excludes) }, {
+			queries: 3, excludes: [[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**']],
+		});
+	});
+
+	test('retries a failed replacement while retaining the useful previous watch', async () => {
+		const session = AgentSession.uri('mock', 'retry-replacement').toString();
+		const root = URI.file('/repo');
+		let folders = [URI.file('/repo/output')];
+		const environment = createEnvironment(root, { ...createGitService(root), getIgnoredFolders: async () => folders });
+		createSession(environment.stateManager, session, root.toString());
+		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
+		await tick();
+		environment.monitor.failAcquire = true;
+		folders = [];
+		environment.fileService.writeGitIgnore(root, '');
+		await tick();
+		const disposals = [...environment.monitor.disposals];
+		environment.monitor.failAcquire = false;
+		environment.coordinator.onSessionRestored(session);
+		await tick();
+		assert.deepStrictEqual({ beforeRetry: disposals.length, afterRetry: environment.monitor.disposals.length, last: environment.monitor.acquiredExcludes.at(-1)?.excludes }, {
+			beforeRetry: 0, afterRetry: 1, last: [...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**'],
+		});
+	});
+
+	test('recomputes ignored folders when the index outside a worktree changes', async () => {
+		const session = AgentSession.uri('mock', 'index-change').toString();
+		const root = URI.file('/repo');
+		let folders = [URI.file('/repo/output')];
+		const index = URI.file('/main/.git/worktrees/repo/index');
+		const environment = createEnvironment(root, {
+			...createGitService(root), getIgnoredFolders: async () => folders, getRepositoryWatchPaths: async () => [index],
+		});
+		createSession(environment.stateManager, session, root.toString());
+		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
+		await tick();
+		environment.gitStateService.clearRefreshes();
+		folders = [];
+		environment.fileService.fire(index);
+		await tick();
+		assert.deepStrictEqual({ paths: environment.fileService.watchedPaths, last: environment.monitor.acquiredExcludes.at(-1)?.excludes, refreshed: environment.gitStateService.refreshed.includes(session) }, {
+			paths: [index.toString(), root.toString(), index.toString(), root.toString()], last: [...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**'], refreshed: true,
+		});
+	});
+
+	test('does not prune ignored folders when metadata acquisition fails', async () => {
+		const session = AgentSession.uri('mock', 'metadata-failure').toString();
+		const root = URI.file('/repo');
+		const environment = createEnvironment(root, { ...createGitService(root), getIgnoredFolders: async () => [URI.file('/repo/output')] });
+		environment.fileService.failMetadataWatch = true;
+		createSession(environment.stateManager, session, root.toString());
+		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
+		await tick();
+		assert.deepStrictEqual({ excludes: environment.monitor.acquiredExcludes.map(item => item.excludes), metadataWatches: environment.fileService.activeMetadataWatches }, {
+			excludes: [[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**']], metadataWatches: 0,
+		});
+	});
+
+	test('revalidates ignored folders after replacement acquisition', async () => {
+		const session = AgentSession.uri('mock', 'verify-snapshot').toString();
+		const root = URI.file('/repo');
+		let queries = 0;
+		const environment = createEnvironment(root, { ...createGitService(root), getIgnoredFolders: async () => ++queries === 1 ? [URI.file('/repo/output')] : [] });
+		createSession(environment.stateManager, session, root.toString());
+		environment.coordinator.onFirstSubscriber(URI.parse(buildUncommittedChangesetUri(session)));
+		await tick();
+		assert.deepStrictEqual(environment.monitor.acquiredExcludes.map(item => item.excludes), [
+			[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'output/**/*'],
+			[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**'],
 		]);
 	});
 
@@ -1926,7 +2050,7 @@ suite('ChangesetSessionCoordinator', () => {
 		}, {
 			acquiredExcludes: [
 				[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**'],
-				[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'sub/output'],
+				[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'sub/output/**/*'],
 			],
 			disposals: [root.toString()],
 			gitStateRefreshes: [session],
@@ -1944,7 +2068,7 @@ suite('ChangesetSessionCoordinator', () => {
 		await environment.monitor.waitForAcquisitions(1);
 
 		assert.deepStrictEqual(environment.monitor.acquiredExcludes.map(acquisition => acquisition.excludes), [
-			[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**', 'target/**/*'],
+			[...DEFAULT_AGENT_HOST_WATCH_EXCLUDES, '**/node_modules', '**/node_modules/**'],
 		]);
 	});
 
@@ -2046,6 +2170,7 @@ suite('ChangesetSessionCoordinator', () => {
 		const { active, owners } = createManyWorktreeSession(environment, session);
 		environment.coordinator.onFirstSubscriber(URI.parse(session));
 		const subscribed = [...environment.changesets.branchRefreshes].sort();
+		await environment.monitor.waitForAcquisitions(1);
 		environment.changesets.clearRefreshes();
 
 		for (const chat of active) {
@@ -2103,6 +2228,7 @@ suite('ChangesetSessionCoordinator', () => {
 		const session = AgentSession.uri('mock', 'available-one-by-one').toString();
 		const { active, archived, owners } = createManyWorktreeSession(environment, session);
 		environment.coordinator.onFirstSubscriber(URI.parse(session));
+		await environment.monitor.waitForAcquisitions(1);
 		environment.changesets.clearRefreshes();
 		environment.gitStateService.clearRefreshes();
 
@@ -2312,6 +2438,8 @@ function createGitServiceFromResolver(resolveRoot: (workingDirectory: URI) => UR
 	return {
 		...createNoopGitService(),
 		rootLookupCalls,
+		getIgnoredFolders: async () => [],
+		getRepositoryWatchPaths: async workingDirectory => [joinPath(workingDirectory, '.git', 'index')],
 		async getRepositoryRoot(workingDirectory: URI): Promise<URI | undefined> {
 			rootLookupCalls.push(workingDirectory.toString());
 			releaseWaiters();
@@ -2422,11 +2550,11 @@ class TestFileMonitorService extends Disposable implements IAgentHostFileMonitor
 
 	waitForAcquisitions(count: number): Promise<void> {
 		if (this.acquisitions.length >= count) {
-			return Promise.resolve();
+			return tick();
 		}
 		const deferred = new DeferredPromise<void>();
 		this._acquisitionWaiters.push({ count, deferred });
-		return deferred.p;
+		return deferred.p.then(() => tick());
 	}
 
 	private _releaseAcquisitionWaiters(): void {
@@ -2440,11 +2568,11 @@ class TestFileMonitorService extends Disposable implements IAgentHostFileMonitor
 
 	waitForDisposals(count: number): Promise<void> {
 		if (this.disposals.length >= count) {
-			return Promise.resolve();
+			return tick();
 		}
 		const deferred = new DeferredPromise<void>();
 		this._disposalWaiters.push({ count, deferred });
-		return deferred.p;
+		return deferred.p.then(() => tick());
 	}
 
 	private _releaseDisposalWaiters(): void {
@@ -2468,10 +2596,22 @@ class TestGitIgnoreFileService extends Disposable {
 	readonly onDidStartRead = this._onDidStartRead.event;
 	private readonly _contents = new Map<string, string>();
 	private _readBarrier: DeferredPromise<void> | undefined;
+	readonly watchedPaths: string[] = [];
+	activeMetadataWatches = 0;
+	failMetadataWatch = false;
 
 	readonly service = {
 		_serviceBrand: undefined,
 		onDidFilesChange: this._onDidFilesChange.event,
+		createWatcher: (resource: URI) => {
+			this.watchedPaths.push(resource.toString());
+			this.activeMetadataWatches++;
+			return {
+				ready: this.failMetadataWatch ? Promise.reject(new Error('metadata watch failed')) : Promise.resolve(),
+				onDidChange: Event.filter(this._onDidFilesChange.event, event => event.contains(resource)),
+				dispose: () => { this.activeMetadataWatches--; },
+			};
+		},
 		readFile: async (resource: URI): Promise<IFileContent> => {
 			const barrier = this._readBarrier;
 			this._onDidStartRead.fire(resource);
@@ -2488,6 +2628,10 @@ class TestGitIgnoreFileService extends Disposable {
 		const resource = joinPath(root, GIT_IGNORE_FILE_NAME);
 		const type = this._contents.has(resource.toString()) ? FileChangeType.UPDATED : FileChangeType.ADDED;
 		this._contents.set(resource.toString(), contents);
+		this._onDidFilesChange.fire(new FileChangesEvent([{ resource, type }], false));
+	}
+
+	fire(resource: URI, type: FileChangeType = FileChangeType.UPDATED): void {
 		this._onDidFilesChange.fire(new FileChangesEvent([{ resource, type }], false));
 	}
 

@@ -924,6 +924,32 @@ export class AgentHostGitService implements IAgentHostGitService {
 		return folders;
 	}
 
+	async getRepositoryWatchPaths(workingDirectory: URI): Promise<readonly URI[] | undefined> {
+		const root = await this.getRepositoryRoot(workingDirectory);
+		if (!root) {
+			return undefined;
+		}
+		const metadata = await this._runGit(root, ['rev-parse', '--path-format=absolute', '--git-path', 'index', '--git-path', 'info/exclude', '--git-path', 'config', '--git-path', 'config.worktree']);
+		const config = await this._runGit(root, ['config', '--null', '--show-origin', '--list']);
+		if (metadata === undefined || config === undefined) {
+			return undefined;
+		}
+		const paths = new Set(metadata.trim().split('\n'));
+		const entries = config.split('\0');
+		for (let i = 0; i + 1 < entries.length; i += 2) {
+			if (entries[i].startsWith('file:')) {
+				paths.add(path.resolve(root.fsPath, entries[i].slice(5)));
+			}
+		}
+		const home = this._environmentService.userHome.fsPath;
+		const configHome = process.env['XDG_CONFIG_HOME'] || path.join(home, '.config');
+		paths.add(process.env['GIT_CONFIG_GLOBAL'] || path.join(home, '.gitconfig'));
+		paths.add(path.join(configHome, 'git/config'));
+		const excludesFile = await this._runGit(root, ['config', '--path', '--get', 'core.excludesFile']);
+		paths.add(excludesFile?.trim() ? path.resolve(root.fsPath, excludesFile.trim()) : path.join(configHome, 'git/ignore'));
+		return [...paths].filter(Boolean).map(file => URI.file(file));
+	}
+
 	/**
 	 * Resolves the merge-base commit-ish the Branch Changes baseline is anchored
 	 * on. With a base branch, prefers the corresponding `origin/<base>`
