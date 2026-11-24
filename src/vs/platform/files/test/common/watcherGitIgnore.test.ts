@@ -115,6 +115,13 @@ suite('Watcher .gitignore excludes', () => {
 		].join('\r\n')), ['target/**/*', 'out{,/**}']);
 	});
 
+	test('protects nested ignore files and Git metadata from anchored and wildcard excludes', () => {
+		assert.deepStrictEqual(getWatcherExcludesFromGitIgnore([
+			'nested/.gitignore', '*/.gitignore', '/a/b/.git/', '*/.git/', '/a/.GITIGNORE',
+			'/safe/output/',
+		].join('\n')), ['safe/output/**/*']);
+	});
+
 	test('excludes match the expected paths of the watched folder', () => {
 		// `tmp/` also matches a parent of the watched folder, which must not matter
 		const folder = URI.file('/tmp/repo').fsPath;

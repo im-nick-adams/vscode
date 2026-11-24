@@ -211,6 +211,11 @@ function toWatcherExcludes(pattern: IGitIgnorePattern): string[] | undefined {
 		return undefined; // some watchers treat a leading `!` as negation
 	}
 
+	const metadataGlob = glob.replace(/\/\*\*$/, '');
+	if (mayMatchSameName(getName(metadataGlob), GIT_IGNORE_FILE_NAME) || metadataGlob.split('/').some(segment => mayMatchSameName(segment, '.git'))) {
+		return undefined;
+	}
+
 	let suffixes: string[];
 	if (glob.endsWith('/**')) {
 		if (pattern.directoryOnly) {
